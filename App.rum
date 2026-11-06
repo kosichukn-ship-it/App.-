@@ -1,0 +1,156 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+from datetime import datetime, date
+import io
+
+DB_NAME = "cleaning_firm.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS employees 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rate_per_hour REAL, password TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS work_logs 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER, 
+                  work_date TEXT, hours REAL, object_name TEXT, comment TEXT,
+                  FOREIGN KEY(employee_id) REFERENCES employees(id))''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- Функции БД ---
+def get_employees():
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query("SELECT * FROM employees", conn)
+    conn.close()
+    return df
+
+def add_employee(name, rate, password):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO employees (name, rate_per_hour, password) VALUES (?, ?, ?)", (name, rate, password))
+    conn.commit()
+    conn.close()
+
+def log_hours(emp_id, work_date, hours, obj_name, comment):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO work_logs (employee_id, work_date, hours, object_name, comment) VALUES (?, ?, ?, ?, ?)",
+              (emp_id, work_date, hours, obj_name, comment))
+    conn.commit()
+    conn.close()
+
+def get_salary_report(start_date, end_date):
+    conn = sqlite3.connect(DB_NAME)
+    query = f"""
+        SELECT e.name AS 'Сотрудник', e.rate_per_hour AS 'Ставка в час',
+               SUM(w.hours) AS 'Всего часов', 
+               SUM(w.hours * e.rate_per_hour) AS 'К выплате (zl)'
+        FROM work_logs w
+        JOIN employees e ON w.employee_id = e.id
+        WHERE w.work_date BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY e.id
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+def get_detailed_logs(start_date, end_date):
+    conn = sqlite3.connect(DB_NAME)
+    query = f"""
+        SELECT w.work_date AS 'Дата', e.name AS 'Сотрудник', 
+               w.object_name AS 'Объект', w.hours AS 'Часы', w.comment AS 'Комментарий'
+        FROM work_logs w
+        JOIN employees e ON w.employee_id = e.id
+        WHERE w.work_date BETWEEN '{start_date}' AND '{end_date}'
+        ORDER BY w.work_date DESC
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+# --- Интерфейс ---
+st.set_page_config(page_title="Клининг Учет", layout="wide", page_icon="🧹")
+
+# ПРИДУМАЙТЕ СВОЙ ПАРОЛЬ АДМИНИСТРАТОРА ТУТ:
+ADMIN_PASSWORD = "superboss2026"
+
+st.sidebar.title("🔐 Вход в систему")
+user_role = st.sidebar.radio("Кто вы?", ["Сотрудник", "Администратор"])
+
+# --- РЕЖИМ АДМИНИСТРАТОРА ---
+if user_role == "Администратор":
+    pwd = st.sidebar.text_input("Введите пароль администратора", type="password")
+    if pwd == ADMIN_PASSWORD:
+        st.title("📊 Панель Управления (Админ)")
+        
+        menu = ["📈 Расчет зарплат и Отчеты", "👥 Добавить/Управлять персоналом"]
+        choice = st.selectbox("Выберите действие", menu)
+        
+        if choice == "📈 Расчет зарплат и Отчеты":
+            col1, col2 = st.columns(2)
+            with col1: start_dt = st.date_input("Начало периода", date.today().replace(day=1))
+            with col2: end_dt = st.date_input("Конец периода", date.today())
+            
+            st.subheader("💰 Сводная ведомость")
+            report_df = get_salary_report(str(start_dt), str(end_dt))
+            if not report_df.empty:
+                st.dataframe(report_df, use_container_width=True)
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    report_df.to_excel(writer, sheet_name='Зарплата', index=False)
+                st.download_button("📥 Скачать отчет в Excel", data=buffer.getvalue(), file_name=f"vyplaty_{start_dt}_{end_dt}.xlsx")
+            else:
+                st.info("Нет записей.")
+                
+            st.subheader("📋 История всех уборок")
+            det_df = get_detailed_logs(str(start_dt), str(end_dt))
+            if not det_df.empty: st.dataframe(det_df, use_container_width=True)
+
+        elif choice == "👥 Добавить/Управлять персоналом":
+            st.subheader("Добавление нового работника")
+            with st.form("new_emp_form"):
+                name = st.text_input("Имя и Фамилия")
+                rate = st.number_input("Ставка (zl/час)", min_value=1.0, value=30.0)
+                emp_pwd = st.text_input("Личный пароль сотрудника для входа", type="password")
+                if st.form_submit_button("Сохранить"):
+                    if name and emp_pwd:
+                        add_employee(name, rate, emp_pwd)
+                        st.success(f"Работнику {name} открыт доступ!")
+            
+            st.subheader("Список сотрудников")
+            st.dataframe(get_employees()[['name', 'rate_per_hour']].rename(columns={'name':'Имя', 'rate_per_hour':'Ставка в час'}), use_container_width=True)
+    elif pwd != "":
+        st.error("Неверный пароль администратора!")
+
+# --- РЕЖИМ СОТРУДНИКА ---
+else:
+    st.title("⏱️ Личный кабинет работника")
+    employees_df = get_employees()
+    
+    if employees_df.empty:
+        st.info("В базе еще нет сотрудников. Попросите администратора добавить вас.")
+    else:
+        emp_options = {row['name']: (row['id'], row['password']) for idx, row in employees_df.iterrows()}
+        selected_emp = st.selectbox("Выберите ваше имя", list(emp_options.keys()))
+        emp_password_input = st.text_input("Введите ваш личный пароль", type="password")
+        
+        if emp_password_input:
+            correct_id, correct_pwd = emp_options[selected_emp]
+            if emp_password_input == correct_pwd:
+                st.success(f"Авторизация успешна! Добро пожаловать, {selected_emp}.")
+                
+                st.subheader("📝 Внести отработанные часы")
+                with st.form("log_hours_worker", clear_on_submit=True):
+                    work_date = st.date_input("Дата уборки", date.today())
+                    hours = st.number_input("Сколько часов отработано", min_value=0.5, max_value=16.0, value=8.0, step=0.5)
+                    object_name = st.text_input("Название объекта / Адрес")
+                    comment = st.text_area("Что было сделано / Примечание")
+                    
+                    if st.form_submit_button("Отправить отчет"):
+                        log_hours(correct_id, str(work_date), hours, object_name, comment)
+                        st.success("Часы успешно отправлены на проверку руководителю!")
+            else:
+                st.error("Неверный личный пароль!")
